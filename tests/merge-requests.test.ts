@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { GongfengApiError } from "../src/services/api-client.js";
 import {
+  changeMergeRequestReviewers,
+  getMergeRequestChangesWithFallback,
   getMergeRequestWithFallback,
   mergeMergeRequest,
   normalizeMergeRequestState,
   resolveMergeRequestIdentity,
+  updateMergeRequest,
 } from "../src/tools/merge-requests.js";
 
 describe("merge request endpoint compatibility", () => {
@@ -167,5 +170,155 @@ describe("merge request endpoint compatibility", () => {
     expect(normalizeMergeRequestState("all")).toBeUndefined();
     expect(normalizeMergeRequestState("merged")).toBe("merged");
     expect(normalizeMergeRequestState(undefined)).toBeUndefined();
+  });
+});
+
+describe("merge request write paths", () => {
+  it("updates through the singular internal-id route and verifies the record", async () => {
+    const calls: string[] = [];
+    const bodies: Array<Record<string, unknown>> = [];
+    const client = {
+      async get(path: string) {
+        calls.push(`GET ${path}`);
+        if (path.endsWith("/merge_requests")) {
+          return { api_path: `GET ${path}`, data: [{ id: 2177041, iid: 73, state: "opened" }] };
+        }
+        return { api_path: `GET ${path}`, data: { id: 2177041, iid: 73, title: "new title", state: "closed" } };
+      },
+      async put(path: string, body: Record<string, unknown>) {
+        calls.push(`PUT ${path}`);
+        bodies.push(body);
+        return { api_path: `PUT ${path}`, data: { id: 2177041, iid: 73 } };
+      },
+    };
+
+    const result = await updateMergeRequest(client as never, "ChainWeaver/ida/user-center", {
+      merge_request_iid: 73,
+      title: "new title",
+      state_event: "close",
+    });
+
+    expect(calls).toEqual([
+      "GET projects/ChainWeaver%2Fida%2Fuser-center/merge_requests",
+      "PUT projects/ChainWeaver%2Fida%2Fuser-center/merge_request/2177041",
+      "GET projects/ChainWeaver%2Fida%2Fuser-center/merge_request/2177041",
+    ]);
+    expect(bodies).toEqual([{ title: "new title", state_event: "close" }]);
+    expect(result.data.merge_request).toMatchObject({ id: 2177041, title: "new title" });
+  });
+
+  it("rejects merge-only flags on a plain update and empty update bodies", async () => {
+    const client = { async get() { throw new Error("must not call the API"); } };
+
+    await expect(
+      updateMergeRequest(client as never, "p", { merge_request_iid: 1, squash: true }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      updateMergeRequest(client as never, "p", { merge_request_iid: 1 }),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("invites reviewers one by one on the singular review endpoint", async () => {
+    const calls: string[] = [];
+    const bodies: Array<Record<string, unknown>> = [];
+    const client = {
+      async get(path: string) {
+        calls.push(`GET ${path}`);
+        if (path.endsWith("/merge_requests")) {
+          return { api_path: `GET ${path}`, data: [{ id: 2177041, iid: 73 }] };
+        }
+        return { api_path: `GET ${path}`, data: { reviewers: [{ id: 7 }] } };
+      },
+      async post(path: string, body: Record<string, unknown>) {
+        calls.push(`POST ${path}`);
+        bodies.push(body);
+        if (String(body.reviewer_id) === "8") throw new GongfengApiError("conflict", 409);
+        return { api_path: `POST ${path}`, data: {} };
+      },
+    };
+
+    const result = await changeMergeRequestReviewers(
+      client as never,
+      "ChainWeaver/ida/user-center",
+      { merge_request_iid: 73, reviewer_ids: [7, "8"] },
+      "invite",
+    );
+
+    expect(bodies).toEqual([{ reviewer_id: 7 }, { reviewer_id: 8 }]);
+    expect(calls.filter((call) => call.startsWith("POST"))).toEqual([
+      "POST projects/ChainWeaver%2Fida%2Fuser-center/merge_request/2177041/review/invite",
+      "POST projects/ChainWeaver%2Fida%2Fuser-center/merge_request/2177041/review/invite",
+    ]);
+    expect(result.data.succeeded).toEqual(["7"]);
+    expect(result.data.failed).toHaveLength(1);
+    expect(result.data.failed[0]).toMatchObject({ reviewer_id: "8", status: 409 });
+    expect(result.data.review).toEqual({ reviewers: [{ id: 7 }] });
+  });
+
+  it("removes reviewers through the dismissals endpoint with a reviewer_id query", async () => {
+    const deletes: string[] = [];
+    const client = {
+      async get(path: string) {
+        if (path.endsWith("/merge_requests")) return { api_path: "GET list", data: [{ id: 2177041, iid: 73 }] };
+        return { api_path: `GET ${path}`, data: { reviewers: [] } };
+      },
+      async delete(path: string, _body: unknown, query: Record<string, unknown>) {
+        deletes.push(`DELETE ${path}?reviewer_id=${String(query.reviewer_id)}`);
+        return { api_path: `DELETE ${path}`, data: {} };
+      },
+    };
+
+    const result = await changeMergeRequestReviewers(
+      client as never,
+      "ChainWeaver/ida/user-center",
+      { merge_request_iid: 73, reviewer_ids: [7] },
+      "remove",
+    );
+
+    expect(deletes).toEqual([
+      "DELETE projects/ChainWeaver%2Fida%2Fuser-center/merge_request/2177041/review/dismissals?reviewer_id=7",
+    ]);
+    expect(result.data.succeeded).toEqual(["7"]);
+    expect(result.data.failed).toEqual([]);
+  });
+
+  it("surfaces every reviewer failure when nothing succeeds", async () => {
+    const client = {
+      async get(path: string) {
+        if (path.endsWith("/merge_requests")) return { api_path: "GET list", data: [{ id: 2177041, iid: 73 }] };
+        return { api_path: `GET ${path}`, data: {} };
+      },
+      async delete() {
+        throw new GongfengApiError("Reviewer not found", 404);
+      },
+    };
+
+    await expect(
+      changeMergeRequestReviewers(
+        client as never,
+        "ChainWeaver/ida/user-center",
+        { merge_request_iid: 73, reviewer_ids: [7, 8] },
+        "remove",
+      ),
+    ).rejects.toMatchObject({
+      status: 404,
+      details: { action: "remove", failed: [{ reviewer_id: "7" }, { reviewer_id: "8" }] },
+    });
+  });
+
+  it("adds a GitLab-compatible changes alias to the Gongfeng files payload", async () => {
+    const files = [{ old_path: "a.txt", new_path: "a.txt" }, { old_path: "b.txt", new_path: "b.txt" }];
+    const client = {
+      async get() {
+        return { api_path: "GET changes", data: { id: 2177041, files } };
+      },
+    };
+
+    const result = await getMergeRequestChangesWithFallback(client as never, "p", 73);
+    const data = result.data as Record<string, unknown>;
+
+    expect(data.changes).toEqual(files);
+    expect(data.changes_count).toBe(2);
+    expect(data.files).toEqual(files);
   });
 });
